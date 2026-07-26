@@ -1,0 +1,57 @@
+name: Build Web2APK
+run-name: ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      web_url:
+        description: "URL website yang akan dibungkus jadi APK"
+        required: true
+      app_name:
+        description: "Nama aplikasi"
+        required: true
+      icon_url:
+        description: "URL icon (dari GitHub Release asset)"
+        required: true
+      tag:
+        description: "Tag unik untuk build ini"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Ganti "actions/checkout" ini supaya mengambil template Android WebView
+      # kamu sendiri (mis. folder android-template di project web2apk yang
+      # sudah kamu buat sebelumnya), lalu isi WEB_URL / APP_NAME / ICON_URL
+      # ke AndroidManifest.xml / strings.xml sesuai kebutuhan template kamu.
+      - name: Checkout android template repo
+        uses: actions/checkout@v4
+
+      - name: Download icon
+        run: curl -L "${{ inputs.icon_url }}" -o app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+
+      - name: Inject WEB_URL & APP_NAME
+        run: |
+          sed -i "s#WEBVIEW_URL_PLACEHOLDER#${{ inputs.web_url }}#g" app/src/main/java/*/*/MainActivity.java || true
+          sed -i "s#APP_NAME_PLACEHOLDER#${{ inputs.app_name }}#g" app/src/main/res/values/strings.xml || true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Build APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.tag }}
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 1
+          
