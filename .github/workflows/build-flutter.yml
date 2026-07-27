@@ -15,6 +15,10 @@ on:
         required: true
         default: "release"
 
+concurrency:
+  group: build-flutter-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -22,9 +26,43 @@ jobs:
     steps:
       - name: Download project ZIP
         run: |
-          curl -L "${{ inputs.zip_url }}" -o project.zip
+          set -euo pipefail
+          echo "Mengunduh: ${{ inputs.zip_url }}"
+          # --fail  -> exit non-zero kalau server balas 4xx/5xx (bukan bikin file kosong/HTML)
+          # --retry -> otomatis coba lagi kalau koneksi putus-putus
+          curl -fL --retry 3 --retry-delay 5 --connect-timeout 15 \
+            "${{ inputs.zip_url }}" -o project.zip
+
+          if [ ! -s project.zip ]; then
+            echo "::error::project.zip kosong atau gagal diunduh."
+            exit 1
+          fi
+
           mkdir -p project
-          unzip -q project.zip -d project
+          if ! unzip -q project.zip -d project; then
+            echo "::error::Gagal extract project.zip — pastikan file ZIP tidak corrupt."
+            exit 1
+          fi
+
+      - name: Deteksi struktur project (handle nested folder)
+        working-directory: project
+        run: |
+          set -euo pipefail
+          # Kalau hasil unzip berupa 1 folder pembungkus tanpa pubspec.yaml
+          # di root (mis. project/myapp/pubspec.yaml), naikkan isinya ke root
+          # supaya "working-directory: project" di step berikutnya selalu benar.
+          if [ ! -f "pubspec.yaml" ]; then
+            nested_dir=$(find . -mindepth 2 -maxdepth 2 -name "pubspec.yaml" -print -quit | xargs -r dirname)
+            if [ -n "$nested_dir" ]; then
+              echo "pubspec.yaml ditemukan di folder nested: $nested_dir — memindahkan ke root"
+              shopt -s dotglob
+              mv "$nested_dir"/* .
+            fi
+          fi
+          if [ ! -f "pubspec.yaml" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan. Pastikan ZIP berisi project Flutter yang valid."
+            exit 1
+          fi
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -36,20 +74,37 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: "stable"
+          cache: true
 
       - name: Flutter pub get
         working-directory: project
-        run: flutter pub get
+        run: |
+          set -euo pipefail
+          flutter pub get
 
       - name: Build APK (release)
         if: ${{ inputs.build_type == 'release' }}
         working-directory: project
-        run: flutter build apk --release
+        run: |
+          set -euo pipefail
+          flutter build apk --release
 
       - name: Build APK (debug)
         if: ${{ inputs.build_type == 'debug' }}
         working-directory: project
-        run: flutter build apk --debug
+        run: |
+          set -euo pipefail
+          flutter build apk --debug
+
+      - name: Verifikasi APK berhasil dibuat
+        working-directory: project
+        run: |
+          set -euo pipefail
+          apk_count=$(find build/app/outputs/flutter-apk -maxdepth 1 -name "*.apk" 2>/dev/null | wc -l)
+          if [ "$apk_count" -eq 0 ]; then
+            echo "::error::Build selesai tapi tidak ada file .apk yang dihasilkan."
+            exit 1
+          fi
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -57,4 +112,4 @@ jobs:
           name: apk-${{ inputs.tag }}
           path: project/build/app/outputs/flutter-apk/*.apk
           retention-days: 1
-          
+          if-no-files-found: error
