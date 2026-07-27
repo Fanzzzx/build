@@ -16,26 +16,78 @@ on:
       tag:
         description: "Tag unik untuk build ini"
         required: true
+      template_repo:
+        description: "Repo template Android WebView, format owner/repo (kosongkan untuk pakai repo ini sendiri)"
+        required: false
+        default: ""
+
+concurrency:
+  group: build-web2apk-${{ inputs.tag }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      # Ganti "actions/checkout" ini supaya mengambil template Android WebView
-      # kamu sendiri (mis. folder android-template di project web2apk yang
-      # sudah kamu buat sebelumnya), lalu isi WEB_URL / APP_NAME / ICON_URL
-      # ke AndroidManifest.xml / strings.xml sesuai kebutuhan template kamu.
+      # PENTING: workflow ini butuh repo template Android WebView yang sudah
+      # berisi struktur project Gradle (app/src/main/... + gradlew) dengan
+      # placeholder WEBVIEW_URL_PLACEHOLDER dan APP_NAME_PLACEHOLDER di
+      # source-nya. Isi input "template_repo" (mis. "usernamekamu/web2apk-template")
+      # kalau template-nya ada di repo terpisah, atau biarkan kosong kalau
+      # template sudah ada langsung di repo ini.
       - name: Checkout android template repo
         uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.template_repo != '' && inputs.template_repo || github.repository }}
+
+      - name: Validasi struktur template
+        run: |
+          set -euo pipefail
+          if [ ! -f "gradlew" ]; then
+            echo "::error::File 'gradlew' tidak ditemukan di root repo template. Pastikan input 'template_repo' menunjuk ke repo Android WebView yang benar."
+            exit 1
+          fi
+          if [ ! -d "app/src/main/res/mipmap-xxxhdpi" ]; then
+            echo "::error::Folder app/src/main/res/mipmap-xxxhdpi tidak ditemukan — struktur project Android tidak sesuai."
+            exit 1
+          fi
 
       - name: Download icon
-        run: curl -L "${{ inputs.icon_url }}" -o app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 5 --connect-timeout 15 \
+            "${{ inputs.icon_url }}" -o app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+          if [ ! -s app/src/main/res/mipmap-xxxhdpi/ic_launcher.png ]; then
+            echo "::error::Gagal download icon dari icon_url, atau file hasil download kosong."
+            exit 1
+          fi
 
       - name: Inject WEB_URL & APP_NAME
         run: |
-          sed -i "s#WEBVIEW_URL_PLACEHOLDER#${{ inputs.web_url }}#g" app/src/main/java/*/*/MainActivity.java || true
-          sed -i "s#APP_NAME_PLACEHOLDER#${{ inputs.app_name }}#g" app/src/main/res/values/strings.xml || true
+          set -euo pipefail
+
+          main_activity=$(find app/src/main/java -name "MainActivity.java" -print -quit)
+          if [ -z "$main_activity" ]; then
+            echo "::error::MainActivity.java tidak ditemukan di app/src/main/java/**. Cek struktur package template."
+            exit 1
+          fi
+          if ! grep -q "WEBVIEW_URL_PLACEHOLDER" "$main_activity"; then
+            echo "::error::Placeholder WEBVIEW_URL_PLACEHOLDER tidak ditemukan di $main_activity — template mungkin sudah berubah."
+            exit 1
+          fi
+          sed -i "s#WEBVIEW_URL_PLACEHOLDER#${{ inputs.web_url }}#g" "$main_activity"
+
+          strings_file="app/src/main/res/values/strings.xml"
+          if [ ! -f "$strings_file" ]; then
+            echo "::error::$strings_file tidak ditemukan."
+            exit 1
+          fi
+          if ! grep -q "APP_NAME_PLACEHOLDER" "$strings_file"; then
+            echo "::error::Placeholder APP_NAME_PLACEHOLDER tidak ditemukan di $strings_file — template mungkin sudah berubah."
+            exit 1
+          fi
+          sed -i "s#APP_NAME_PLACEHOLDER#${{ inputs.app_name }}#g" "$strings_file"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -43,10 +95,30 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
       - name: Build APK
         run: |
+          set -euo pipefail
           chmod +x gradlew
-          ./gradlew assembleRelease
+          ./gradlew assembleRelease --stacktrace
+
+      - name: Verifikasi APK berhasil dibuat
+        run: |
+          set -euo pipefail
+          apk_count=$(find app/build/outputs/apk/release -maxdepth 1 -name "*.apk" 2>/dev/null | wc -l)
+          if [ "$apk_count" -eq 0 ]; then
+            echo "::error::Build selesai tapi tidak ada file .apk yang dihasilkan di app/build/outputs/apk/release."
+            exit 1
+          fi
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -54,4 +126,5 @@ jobs:
           name: apk-${{ inputs.tag }}
           path: app/build/outputs/apk/release/*.apk
           retention-days: 1
+          if-no-files-found: error
           
